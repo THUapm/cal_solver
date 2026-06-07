@@ -1,0 +1,17 @@
+{
+  "servers": [
+    {
+      "name": "math_tools",
+      "command": "python",
+      "args": ["mcp_math_tools.py"],
+      "env": {},
+      "allowed_tools": [
+        "symbolic_compute",
+        "numerical_probability",
+        "verify_result",
+        "plot_function",
+        "latex_validate"
+      ]
+    }
+  ]
+}

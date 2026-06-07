@@ -1,0 +1,2 @@
+# Mark the validation set as UTF-16 so GitHub and `git diff` render it correctly
+验证集/*.json encoding=UTF-16

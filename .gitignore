@@ -1,0 +1,21 @@
+.env
+__pycache__/
+*.pyc
+.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.idea/
+.vscode/
+*.log
+config/mcp_servers.json
+
+# Local development state
+.codegraph/
+.opencode/
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
