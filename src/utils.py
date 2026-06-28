@@ -5,10 +5,205 @@ import math
 from src.tools import CALCULUS_REFERENCE, PROBABILITY_REFERENCE
 
 
+LATEX_DELIMITERS: list[dict] = [
+    {"left": "$$", "right": "$$", "display": True},
+    {"left": "$", "right": "$", "display": False},
+    {"left": chr(92) + "[", "right": chr(92) + "]", "display": True},
+    {"left": chr(92) + "(", "right": chr(92) + ")", "display": False},
+]
+
+
 def extract_code_blocks(text: str) -> list[str]:
     pattern = r"```python\s*\n(.*?)```"
     matches = re.findall(pattern, text, re.DOTALL)
     return [m.strip() for m in matches if m.strip()]
+
+
+def normalize_latex_for_katex(text: str) -> str:
+    """归一化 OCR / LLM 输出的 LaTeX, 让 KaTeX 能正确渲染。
+
+    修复:
+    1. LLM / OCR 经常把 \\\\frac 写成 \\\\\\\\frac (4 个反斜杠), 这是 markdown 字符串的二次转义
+       在 KaTeX 里要看到 \frac 必须是单反斜杠
+    2. OCR 把 Unicode ⇒ 识别为 \\\\Rightarrow, 但 LLM 有时输出 \\\\Rightarrow 时会多写一个 \
+    3. \\\\therefore / \\\\to / \\\\cdot 等
+    """
+    if not text:
+        return text
+
+    out = text
+
+    out = re.sub(r"\\\\([a-zA-Z]+)", r"\\\1", out)
+    out = re.sub(r"\\\\([a-zA-Z]+)", r"\\\1", out)
+
+    out = out.replace("\\\\", "\\")
+
+    out = re.sub(r"\\{3,}([a-zA-Z]+)", r"\\\1", out)
+
+    return out
+
+
+def latex_to_html(text: str) -> str:
+    """Convert Markdown text with LaTeX formulas to HTML with MathML.
+
+    Pipeline (block-aware, placeholder-safe):
+      1. Pre-escape any literal placeholder echoes in the source text so they
+         cannot collide with newly-issued ones.
+      2. Stash all math segments (block $$...$$, \\[...\\], inline \\(...\\),
+         $...$) to placeholders of the form ``<mslot data-i="N"></mslot>``.
+         Custom HTML elements survive gr.HTML JSON serialization, are not
+         stripped by Gradio's sanitizer, are invisible to the user (empty
+         content), and do not collide with LLM/OCR output text.
+      3. Split the remaining text into blocks separated by blank lines, then
+         classify each block (heading, ordered list, unordered list, paragraph).
+      4. Restore MathML by replacing ``<mslot data-i="N"></mslot>`` placeholders.
+    """
+    if not text:
+        return ""
+
+    try:
+        from latex2mathml import converter as _mathml
+    except ImportError:
+        _mathml = None
+
+    def _render_math(latex: str, display: bool) -> str:
+        if _mathml is None:
+            return f'<code class="tex-fallback">${latex}$</code>'
+        try:
+            html = _mathml.convert(latex, display="block" if display else "inline")
+            wrapper = "math-block" if display else "math-inline"
+            return f'<span class="{wrapper}">{html}</span>'
+        except Exception:
+            return f'<code class="tex-fallback">${latex}$</code>'
+
+    # 1. Pre-escape any literal placeholder echoes in the source text.
+    out = re.sub(
+        r'<mslot\s+data-i="(\d+)"\s*>\s*</mslot>',
+        r'&lt;mslot data-i="\1"&gt;&lt;/mslot&gt;',
+        text,
+    )
+
+    math_blocks: list[str] = []
+
+    def _slot(idx: int) -> str:
+        return f'<mslot data-i="{idx}"></mslot>'
+
+    def _stash(latex: str, display: bool) -> str:
+        idx = len(math_blocks)
+        math_blocks.append(_render_math(latex.strip(), display=display))
+        return _slot(idx)
+
+    def _stash_display_re(m):
+        return _stash(m.group(1), display=True)
+
+    def _stash_inline_re(m):
+        return _stash(m.group(1), display=False)
+
+    def _parse_delim(s: str, open_seq: str, close_seq: str, display: bool) -> str:
+        """Scan s for open_seq...close_seq pairs (depth-aware), replace with placeholders."""
+        out_parts: list[str] = []
+        last_end = 0
+        i = 0
+        open_len = len(open_seq)
+        close_len = len(close_seq)
+        while i < len(s):
+            if s[i:i + open_len] == open_seq:
+                start = i
+                j = i + open_len
+                depth = 1
+                while j < len(s):
+                    if s[j:j + open_len] == open_seq:
+                        depth += 1
+                        j += open_len
+                    elif s[j:j + close_len] == close_seq:
+                        depth -= 1
+                        if depth == 0:
+                            latex = s[i + open_len:j]
+                            out_parts.append(s[last_end:start])
+                            out_parts.append(_stash(latex, display=display))
+                            last_end = j + close_len
+                            i = last_end
+                            break
+                        j += close_len
+                    else:
+                        j += 1
+                else:
+                    out_parts.append(s[last_end:])
+                    last_end = len(s)
+                    i = len(s)
+                    break
+            else:
+                i += 1
+        if last_end < len(s):
+            out_parts.append(s[last_end:])
+        return "".join(out_parts)
+
+    # 2. Order: long delimiters first to avoid $$ being eaten by $ regex.
+    out = re.sub(r"\$\$([^$]+?)\$\$", _stash_display_re, out, flags=re.DOTALL)
+    out = _parse_delim(out, "\\[", "\\]", display=True)
+    out = _parse_delim(out, "\\(", "\\)", display=False)
+    out = re.sub(r"\$([^$\n]+?)\$", _stash_inline_re, out)
+
+    # 3. Block-aware markdown → HTML
+    chunks = re.split(r"\n[ \t]*\n", out)
+    html_blocks: list[str] = []
+
+    _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+    _OL_RE = re.compile(r"^(\d+)\.\s+(.+)$")
+    _UL_RE = re.compile(r"^[-*]\s+(.+)$")
+    _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+    _CODE_RE = re.compile(r"`([^`]+?)`")
+    _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+    _HR_RE = re.compile(r"^---+\s*$")
+
+    def _inline(s: str) -> str:
+        s = _BOLD_RE.sub(r"<strong>\1</strong>", s)
+        s = _CODE_RE.sub(r"<code>\1</code>", s)
+        s = _LINK_RE.sub(r'<a href="\2" target="_blank">\1</a>', s)
+        return s
+
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        lines = chunk.split("\n")
+
+        if len(lines) == 1 and _HR_RE.match(lines[0]):
+            html_blocks.append("<hr/>")
+            continue
+
+        if len(lines) == 1:
+            m = _HEADING_RE.match(lines[0])
+            if m:
+                level = len(m.group(1))
+                text_content = _inline(m.group(2).strip())
+                html_blocks.append(f"<h{level}>{text_content}</h{level}>")
+                continue
+
+        if all(_OL_RE.match(ln) for ln in lines if ln.strip()):
+            items = "".join(
+                f"<li>{_inline(_OL_RE.match(ln).group(2))}</li>" for ln in lines if ln.strip()
+            )
+            html_blocks.append(f'<ol class="md-list">{items}</ol>')
+            continue
+
+        if all(_UL_RE.match(ln) for ln in lines if ln.strip()):
+            items = "".join(
+                f"<li>{_inline(_UL_RE.match(ln).group(1))}</li>" for ln in lines if ln.strip()
+            )
+            html_blocks.append(f'<ul class="md-list">{items}</ul>')
+            continue
+
+        para = "<br/>".join(_inline(ln) for ln in lines)
+        html_blocks.append(f'<p class="md-para">{para}</p>')
+
+    out = "".join(html_blocks)
+
+    # 4. Restore MathML placeholders.
+    for idx, math_html in enumerate(math_blocks):
+        out = out.replace(_slot(idx), math_html)
+
+    return out
 
 
 def extract_tool_calls(text: str) -> list[dict]:
@@ -46,32 +241,107 @@ def has_final_answer(text: str) -> bool:
 
 
 def format_iteration(i: int, llm_response: str, exec_result: dict | None, mcp_results: list[dict] | None = None) -> str:
+    """只保留解答过程，exec_result / mcp_results 参数保留以保持向后兼容。"""
     parts = [f"### Step {i}\n"]
     parts.append(llm_response)
-    if exec_result is not None:
-        parts.append(f"\n**Code executed:**\n```python\n{exec_result['code']}\n```")
-        if exec_result["success"]:
-            parts.append(f"\n**Result:**\n```\n{exec_result['output']}\n```")
-        else:
-            parts.append(f"\n**Error:**\n```\n{exec_result['output']}\n```")
-    if mcp_results is not None:
-        for mr in mcp_results:
-            parts.append(f"\n**MCP tool '{mr['name']}' called:**")
-            parts.append(f"```json\n{json.dumps(mr['arguments'], ensure_ascii=False)}\n```")
-            parts.append(f"\n**MCP Result:**\n```\n{mr['result']}\n```")
     return "\n".join(parts)
 
 
-LATEX_DELIMITERS = [
-    {"left": "$$", "right": "$$", "display": True},
-    {"left": "$", "right": "$", "display": False},
-    {"left": "\\(", "right": "\\)", "display": False},
-    {"left": "\\[", "right": "\\]", "display": True},
-]
+def strip_code_blocks(text: str) -> str:
+    """移除 LLM 输出里的所有 '```...```' 代码块 + LLM 内部对话/元叙述。
 
+    包括 ```python / ```json / ```tool``` 等任意语言标记的多行代码块,
+    也处理孤立未配对的 ``` 标记。
+
+    额外剥除 LLM 的内部元叙述, 避免泄露到 UI:
+    - ### Step N 类编号
+    - **Step N: ...** 类 LLM 复述编号 (KaTeX 会把 * 解析为上标导致整段乱码)
+    - [步骤N] 类前缀
+    - "输出:" / "实际上" / "我们还可以" / "注意:" 等 agent 间对话
+    """
+    cleaned = text
+
+    # 1. 配对的代码块
+    cleaned = re.sub(r"```[a-zA-Z]*\n.*?```", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.DOTALL)
+
+    # 2. 孤立的代码块
+    cleaned = re.sub(
+        r"```[a-zA-Z]*[^\n]*\n(?:.*?\n)*?(?=\n\n|\n#|\Z)",
+        "",
+        cleaned,
+    )
+
+    # 3. 剥 ### Step N 类元编号
+    cleaned = re.sub(r"###\s*Step\s*\d+\s*###?", "", cleaned, flags=re.IGNORECASE)
+
+    # 3b. 剥 **Step N: ...** 类 LLM 复述编号 (KaTeX 会把 * 解析为上标导致整段乱码)
+    # 用 [\s\S]*? 而不是 \s* (避免 ** 后接 \s* 零长度匹配问题)
+    cleaned = re.sub(r"\*\*Step\s*\d+\s*[:：][\s\S]*?\*\*", "", cleaned, flags=re.IGNORECASE)
+
+    # 4. 剥 [步骤N] / [Step N] 类前缀
+    cleaned = re.sub(r"\[(?:步骤|Step)\s*\d+\]\s*[^\n]*\n?", "", cleaned, flags=re.IGNORECASE)
+
+    # 5. 剥 LLM 内部 agent 对话 (句首/行首模式)
+    agent_dialogue_patterns = [
+        r"^\s*输出[：:].*?\n",
+        r"^\s*输出[（(]简化.*?[)）]\s*[:：]?\s*\n?",
+        r"^\s*实际上[，,].*?\n",
+        r"^\s*我们还可以.*?\n",
+        r"^\s*我们应.*?\n",
+        r"^\s*现在用.*?验证.*?\n",
+        r"^\s*注意[：:].*?\n",
+    ]
+    for pat in agent_dialogue_patterns:
+        cleaned = re.sub(pat, "", cleaned, flags=re.MULTILINE)
+
+    # 6. 剥孤立的'输出' / 'Output' 单词
+    cleaned = re.sub(r"^\s*输出\s*$", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"^\s*Output\s*$", "", cleaned, flags=re.MULTILINE | re.IGNORECASE)
+
+    # 7. 全角 ∗ (U+2217) 与半角 * 互相还原（LLM 偶尔把 ** 写成 ∗∗ 导致 markdown bold 失效）
+    cleaned = cleaned.replace("∗", "*")
+
+    # 8. 中文双字去重：OCR 经常把"令"识别为"令令"、"代回"识别为"代回代回"
+    # 仅当一个 2-4 字中文词被连续重复 ≥2 次时压缩为 1 次
+    cleaned = re.sub(
+        r"([\u4e00-\u9fff]{1,4}?)\1+",
+        r"\1",
+        cleaned,
+    )
+
+    # 9. 压缩连续空行
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    return cleaned.strip()
+
+
+def _expand_equation_chains(text: str) -> str:
+    """后处理: 把跨行 / 含求导符号的 $...$ 升级为 $$...$$ 块, 避免 KaTeX 渲染失败。
+
+    KaTeX 在 $...$ 行内上下文里不支持 \\ (多行换行), 但在 $$...$$ 块里支持。
+    LLM 经常把多行等式链 (如 "a = b \\ c = d") 或含求导符号 (h') 的公式写在 $...$ 内,
+    渲染时上标会掉下一行 / 求导符号丢失。
+    本函数检测含换行符 / 连续反斜杠 / 求导符号的 $...$ 区段, 升为 $$...$$ 独占块。
+    """
+    if not text:
+        return text
+
+    def _maybe_upgrade(m):
+        inner = m.group(1)
+        has_unicode_arrow = any(c in inner for c in chr(0x21D2) + chr(0x21D0) + chr(0x21D4) + chr(0x21D1) + chr(0x21D3) + chr(0x27F6) + chr(0x27F9) + chr(0x27F8))
+        has_latex_arrow = bool(re.search(r"\\(?:Rightarrow|Leftarrow|Leftrightarrow|to|mapsto|longrightarrow|longmapsto)", inner))
+        if "\n" in inner or "\'" in inner or has_unicode_arrow or has_latex_arrow or len(inner) > 60:
+            return "$$\n" + inner.strip() + "\n$$"
+        return m.group(0)
+
+    return re.sub(r"\$([^$]+?)\$", _maybe_upgrade, text, flags=re.DOTALL)
 
 def format_solution(steps: list[str], final_answer: str, verification: str | None = None) -> str:
-    combined = "\n\n".join(steps)
+    # 先对每步 strip_code_blocks (剥 **Step N:** / 内部对话), 再 join
+    cleaned_steps = [strip_code_blocks(s) for s in steps]
+    cleaned_steps = [s for s in cleaned_steps if s]  # 移除空步
+    combined = "\n\n".join(cleaned_steps)
 
     if verification:
         combined += f"\n\n{verification}"
@@ -79,8 +349,7 @@ def format_solution(steps: list[str], final_answer: str, verification: str | Non
     if final_answer and not re.search(r"\\boxed", combined):
         combined += f"\n\n### 最终答案\n\n$$\\boxed{{\\text{{{final_answer}}}}}$$"
 
-    return combined
-
+    return _expand_equation_chains(combined)
 
 def parse_solution_steps(solution: str) -> list[str]:
     step_patterns = [
@@ -90,7 +359,8 @@ def parse_solution_steps(solution: str) -> list[str]:
         matches = re.findall(pattern, solution, re.DOTALL | re.IGNORECASE)
         if len(matches) >= 2:
             ordered = sorted(matches, key=lambda m: int(m[0]))
-            return [m[1].strip() for m in ordered]
+            steps = [m[1].strip() for m in ordered]
+            return _dedupe_steps_by_number(steps)
 
     lines = solution.strip().split("\n")
     steps = []
@@ -109,7 +379,46 @@ def parse_solution_steps(solution: str) -> list[str]:
             current = (current + " " + stripped) if current else stripped
     if current:
         steps.append(current.strip())
-    return steps if steps else [solution.strip()]
+    return _dedupe_steps_by_number(steps) if steps else [solution.strip()]
+
+
+def _dedupe_steps_by_number(steps: list[str]) -> list[str]:
+    """去重 OCR/agent 重复识别产生的步骤。
+
+    两种去重策略叠加:
+    1. 显式编号去重: step 文本开头有 "Step N:" / "步骤N" / "第N步"，按 N 分组保留最长版本
+    2. 内容相似度去重: 多个 step 内容高度相似（SequenceMatcher ratio > 0.7）只保留最长
+    """
+    from difflib import SequenceMatcher
+    num_pat = re.compile(r"^\s*(?:Step|步骤|第)\s*(\d+)\s*[:：.]", re.IGNORECASE)
+
+    by_num: dict[int, str] = {}
+    others: list[str] = []
+    for s in steps:
+        m = num_pat.match(s)
+        if m:
+            n = int(m.group(1))
+            if n not in by_num or len(s) > len(by_num[n]):
+                by_num[n] = s
+        else:
+            others.append(s)
+
+    if by_num:
+        unique = [by_num[k] for k in sorted(by_num)]
+    else:
+        unique = list(steps)
+
+    final: list[str] = []
+    for s in unique + others:
+        is_dup = False
+        for kept in final:
+            ratio = SequenceMatcher(None, s.strip(), kept.strip()).ratio()
+            if ratio > 0.7 and len(s) <= len(kept) * 1.3:
+                is_dup = True
+                break
+        if not is_dup:
+            final.append(s)
+    return final
 
 
 def parse_premise_json(response: str, step_index: int) -> dict:
@@ -248,7 +557,7 @@ def format_review(
         parts.append("批改结果经元验证审查，所有错误判定均为真实错误，无幻觉判断。")
 
     parts.append("\n\n### 📖 正确解法参考")
-    parts.append(standard_reference)
+    parts.append(strip_code_blocks(standard_reference))
 
     combined = "\n".join(parts)
     if not re.search(r"\\boxed", combined):
@@ -259,7 +568,7 @@ def format_review(
             f"$$\\boxed{{\\text{{正确步骤: {correct_count}/{total_count}}}}}$$"
         )
 
-    return combined
+    return _expand_equation_chains(combined)
 
 
 def parse_verification_errors(verify_response: str) -> str | None:
@@ -389,3 +698,81 @@ def parse_usc_selection(selection_response: str) -> int:
         return int(first_num.group(1))
 
     return 1
+
+def parse_step_confidence(grading_text):
+    """Parse confidence per step from grading result. Returns {step_num: confidence}."""
+    if not grading_text:
+        return {}
+
+    block_pattern = re.compile(
+        r'(?:\*\*)?(?:Step|步骤)\s*(\d+)(?:\*\*)?[\s:：.-]*'
+        r'(.*?)(?=(?:\*\*)?(?:Step|步骤)\s*\d+(?:\*\*)?[\s:：.-]*|\Z)',
+        re.I | re.S,
+    )
+    result = {}
+    for step, body in block_pattern.findall(grading_text):
+        m = re.search(r'置信度\*?\*?\s*[:：]?\s*(\d{1,3})\s*%?', body, re.S)
+        if m:
+            result[int(step)] = max(0, min(100, int(m.group(1))))
+
+    if result:
+        return result
+
+    matches = re.findall(r'置信度\*?\*?\s*[:：]?\s*(\d{1,3})\s*%?', grading_text, re.S)
+    return {i + 1: max(0, min(100, int(c))) for i, c in enumerate(matches)}
+
+
+def parse_step_correctness(grading_text):
+    """Parse correctness per step. Returns {step_num: is_correct}."""
+    if not grading_text:
+        return {}
+
+    block_pattern = re.compile(
+        r'(?:\*\*)?(?:Step|步骤)\s*(\d+)(?:\*\*)?[\s:：.-]*'
+        r'(.*?)(?=(?:\*\*)?(?:Step|步骤)\s*\d+(?:\*\*)?[\s:：.-]*|\Z)',
+        re.I | re.S,
+    )
+    result = {}
+    for step, body in block_pattern.findall(grading_text):
+        m = re.search(r'判断\*?\*?\s*[:：]?\s*([✓✗对错正确错误]|correct|incorrect|right|wrong)', body, re.I | re.S)
+        if m:
+            token = m.group(1).lower()
+            result[int(step)] = token in {chr(0x2713), '对', '正确', 'correct', 'right'}
+
+    if result:
+        return result
+
+    matches = re.findall(r'判断\*?\*?\s*[:：]?\s*([✓✗对错正确错误]|correct|incorrect|right|wrong)', grading_text, re.I | re.S)
+    return {
+        i + 1: c.lower() in {chr(0x2713), '对', '正确', 'correct', 'right'}
+        for i, c in enumerate(matches)
+    }
+
+
+def classify_confidence_badge(confidence, is_correct):
+    """Return badge class: correct-high / correct-med / error."""
+    if not is_correct:
+        return "error"
+    if confidence >= 90:
+        return "correct-high"
+    if confidence >= 70:
+        return "correct-med"
+    return "error"
+
+
+def parse_similar_problems(similar_text):
+    """Parse similar problems list from generator output."""
+    problems = []
+    blocks = re.split(r'### 题目\s*(\d+)', similar_text)
+    for i in range(1, len(blocks), 2):
+        idx = blocks[i]
+        body = blocks[i + 1].strip()
+        m = re.search(r'\*\*答[::]?\*\*\s*[:：]?\s*(.+?)(?=###|$)', body, re.S)
+        if m:
+            answer = m.group(1).strip().rstrip('`').strip()
+            problem = body[: m.start()].rstrip('**答**').strip()
+        else:
+            answer = ''
+            problem = body
+        problems.append({'index': int(idx), 'problem': problem, 'answer': answer})
+    return problems

@@ -1,9 +1,9 @@
 <!--
-  assets/head.html — 通过 gradio Blocks(..., head=HEAD) 注入到 <head>。
+  assets/head.html — MathSolver 头部注入
   - Inter / JetBrains Mono 字体（Google Fonts）
-  - KaTeX 0.16.9（jsDelivr CDN）
-  - MutationObserver 监听 .prose / .md，自动重渲染新出现的 LaTeX
-  - 主题切换脚本（点击按钮时切换 :root[data-theme]）
+  - 主题切换脚本
+  - 备注: LaTeX 渲染已迁移到 Python 端 (latex_to_html → MathML), 浏览器原生支持
+  - MutationObserver 保留作为未来扩展点
 -->
 
 <!-- Fonts -->
@@ -11,94 +11,60 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
-<!-- KaTeX -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" crossorigin="anonymous">
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js" crossorigin="anonymous"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
-        crossorigin="anonymous"
-        onload="renderMathInDocument()"></script>
-
+<!-- 主题切换：document.documentElement.dataset.theme = 'light' | 'dark' -->
 <script>
-// 全局 token（与 SKILL.md / style.css 保持一致）
-window.MATH_TOKENS = {
-  light: {
-    '--primary': '#5E6AD2', '--primary-hover': '#6872D9',
-    '--text': '#18181B', '--text-muted': '#71717A',
-    '--surface': '#FFFFFF', '--surface-alt': '#FAFAFA',
-    '--border': '#E4E4E7', '--success': '#10B981', '--error': '#EF4444',
-  },
-  dark: {
-    '--primary': '#6872D9', '--primary-hover': '#7B85DD',
-    '--text': '#FAFAFA', '--text-muted': '#A1A1AA',
-    '--surface': '#0A0A0A', '--surface-alt': '#18181B',
-    '--border': '#27272A', '--success': '#34D399', '--error': '#F87171',
-  }
-};
-
-// KaTeX 自动渲染（debounce + rAF）
-let mathRenderScheduled = false;
-function renderMathInDocument() {
-  if (typeof renderMathInElement !== 'function') return;
-  if (mathRenderScheduled) return;
-  mathRenderScheduled = true;
-  requestAnimationFrame(() => {
-    document.querySelectorAll('.prose, .md, .math-content').forEach(el => {
-      if (el.dataset.mathRendered === '1') return;
-      try {
-        renderMathInElement(el, {
-          delimiters: [
-            {left: '$$', right: '$$', display: true},
-            {left: '$', right: '$', display: false},
-            {left: '\\[', right: '\\]', display: true},
-            {left: '\\(', right: '\\)', display: false}
-          ],
-          throwOnError: false
-        });
-        el.dataset.mathRendered = '1';
-      } catch (e) { /* silent fail */ }
-    });
-    mathRenderScheduled = false;
-  });
-}
-new MutationObserver(renderMathInDocument).observe(
-  document.body, {childList: true, subtree: true}
-);
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', renderMathInDocument);
-} else {
-  renderMathInDocument();
-}
-
-// 主题切换：document.documentElement.dataset.theme = 'light' | 'dark'
 window.toggleTheme = function() {
   const html = document.documentElement;
   const isDark = html.dataset.theme === 'dark';
   const next = isDark ? 'light' : 'dark';
   html.dataset.theme = next;
   const btn = document.getElementById('theme-toggle');
-  if (btn) btn.textContent = next === 'dark' ? '☀' : '🌙';
+  if (btn) btn.textContent = next === 'dark' ? '\u2600' : '\uD83C\uDF19';
   try { localStorage.setItem('mathsolver-theme', next); } catch (e) {}
 };
-// 恢复偏好
 try {
   const saved = localStorage.getItem('mathsolver-theme');
   if (saved === 'dark') {
     document.documentElement.dataset.theme = 'dark';
     document.addEventListener('DOMContentLoaded', () => {
       const btn = document.getElementById('theme-toggle');
-      if (btn) btn.textContent = '☀';
+      if (btn) btn.textContent = '\u2600';
     });
   }
 } catch (e) {}
 
-// KaTeX 加载失败时给出提示
-window.addEventListener('error', function(e) {
-  if (e.filename && e.filename.includes('katex')) {
-    document.querySelectorAll('.prose, .md').forEach(el => {
-      if (el.textContent.includes('$') && !el.querySelector('.katex')) {
-        el.innerHTML = '<div style="color:#F59E0B;padding:8px;background:#FEF3C7;border-radius:6px;margin:8px 0">⚠️ KaTeX 加载失败，LaTeX 公式未渲染（显示为源码）</div>' + el.innerHTML;
-      }
-    });
+// 复制 OCR 结果到剪贴板（兼容 gr.HTML 输出）
+window.copyOcrToClipboard = async function() {
+  let textarea = document.querySelector('textarea[aria-label*="解答内容"]')
+                || document.querySelector('textarea');
+  if (!textarea) {
+    console.warn('OCR textbox not found');
+    return;
   }
-}, true);
+  const text = textarea.value || '';
+  const btn = document.querySelector('.copy-latex-btn');
+  if (!text.trim()) {
+    if (btn) {
+      const orig = btn.textContent;
+      btn.textContent = '\u26A0 文本框为空';
+      setTimeout(() => { btn.textContent = orig; }, 1200);
+    }
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (_) {}
+    document.body.removeChild(ta);
+  }
+  if (btn) {
+    const orig = btn.textContent;
+    btn.textContent = '\u2713 已复制';
+    setTimeout(() => { btn.textContent = orig; }, 1200);
+  }
+};
 </script>

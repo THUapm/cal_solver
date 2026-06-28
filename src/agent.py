@@ -23,12 +23,15 @@ from src.prompts import (
     MCP_TOOL_RESULT_PROMPT,
     MAX_ITERATIONS_PROMPT,
     VERIFICATION_PROMPT,
+    KNOWLEDGE_POINT_PROMPT,
+    SIMILAR_PROBLEM_PROMPT,
 )
 from src.utils import (
     extract_code_blocks,
     extract_tool_calls,
     has_final_answer,
     format_iteration,
+    strip_code_blocks,
     format_solution,
     parse_solution_steps,
     parse_premise_json,
@@ -41,6 +44,8 @@ from src.utils import (
     extract_final_answer_value,
     all_answers_agree,
     parse_usc_selection,
+    parse_step_confidence,
+    parse_step_correctness,
 )
 
 MAX_ITERATIONS = 5
@@ -239,7 +244,7 @@ def solve_single_path(
         tool_calls = extract_tool_calls(response)
 
         if not code_blocks and not tool_calls and has_final_answer(response):
-            all_steps.append(format_iteration(i, response, None))
+            all_steps.append(format_iteration(i, strip_code_blocks(response), None))
             final_answer = response
             yield {"event": "step_done", "i": i, "content": all_steps[-1]}
             break
@@ -286,7 +291,7 @@ def solve_single_path(
             )
             messages.append({"role": "user", "content": mcp_msg})
 
-        all_steps.append(format_iteration(i, response, exec_result, mcp_results))
+        all_steps.append(format_iteration(i, strip_code_blocks(response), exec_result, mcp_results))
         yield {"event": "step_done", "i": i, "content": all_steps[-1]}
 
         if has_final_answer(response):
@@ -297,7 +302,7 @@ def solve_single_path(
             messages.append({"role": "user", "content": MAX_ITERATIONS_PROMPT})
             yield {"event": "step_start", "i": i + 1, "n": max_iter, "label": "汇总最终答案"}
             final_response = solver_chat(messages, temperature=temp, max_tokens=2048)
-            all_steps.append(format_iteration(i + 1, final_response, None))
+            all_steps.append(format_iteration(i + 1, strip_code_blocks(final_response), None))
             yield {"event": "step_done", "i": i + 1, "content": all_steps[-1]}
             final_answer = final_response
             break
@@ -307,10 +312,16 @@ def solve_single_path(
         messages.append({"role": "user", "content": VERIFICATION_PROMPT})
         yield {"event": "verifying", "i": 1}
         verify_response = solver_chat(messages, temperature=0.1, max_tokens=2048)
-        all_steps.append(format_iteration(len(all_steps) + 1, verify_response, None))
-        yield {"event": "step_done", "i": len(all_steps), "content": all_steps[-1]}
-
         errors_found = parse_verification_errors(verify_response)
+        # 不再把整段 verify_response 压进 all_steps（它含 LLM 内部叙述，泄露到 UI 不合适）。
+        # 只在最后一个 step 末尾追加一行验证状态。verify_response 仍留在 messages 历史里供后续 correction 使用。
+        if all_steps:
+            if errors_found:
+                all_steps[-1] = all_steps[-1].rstrip() + "\n\n*（验证：发现错误，已进入修正循环）*"
+            else:
+                all_steps[-1] = all_steps[-1].rstrip() + "\n\n*（验证：✓ 通过）*"
+            yield {"event": "step_done", "i": len(all_steps), "content": all_steps[-1]}
+
         if errors_found:
             yield {"event": "verify_failed", "errors": errors_found}
             for corr_iter in range(MAX_CORRECTION_ITERATIONS):
@@ -345,16 +356,21 @@ def solve_single_path(
                             tool_result=f"Tool '{tc['name']}' result:\n{r}"
                         )})
 
-                all_steps.append(format_iteration(len(all_steps) + 1, corr_response, corr_exec, corr_mcp))
+                all_steps.append(format_iteration(len(all_steps) + 1, strip_code_blocks(corr_response), corr_exec, corr_mcp))
                 yield {"event": "step_done", "i": len(all_steps), "content": all_steps[-1]}
 
                 messages.append({"role": "user", "content": VERIFICATION_PROMPT})
                 yield {"event": "verifying", "i": corr_iter + 2}
                 reverify = solver_chat(messages, temperature=0.1, max_tokens=2048)
-                all_steps.append(format_iteration(len(all_steps) + 1, reverify, None))
-                yield {"event": "step_done", "i": len(all_steps), "content": all_steps[-1]}
-
                 new_errors = parse_verification_errors(reverify)
+                # 同上：不把整段 reverify 塞进 all_steps，只在 correction step 末尾追加状态
+                if all_steps:
+                    if not new_errors:
+                        all_steps[-1] = all_steps[-1].rstrip() + "\n\n*（重新验证：✓ 通过）*"
+                    else:
+                        all_steps[-1] = all_steps[-1].rstrip() + "\n\n*（重新验证：仍发现错误）*"
+                    yield {"event": "step_done", "i": len(all_steps), "content": all_steps[-1]}
+
                 if not new_errors:
                     yield {"event": "verify_passed"}
                     final_answer = corr_response if has_final_answer(corr_response) else reverify
@@ -498,7 +514,16 @@ def review(
                 f"{student_solution}\n"
                 "</user_uploaded_content>"
             )
-            combined_solution = f"{wrapped_student}\n\n{wrapped_solution_ocr}"
+            from difflib import SequenceMatcher
+            ratio = SequenceMatcher(
+                None,
+                student_solution.strip(),
+                solution_ocr.strip(),
+            ).ratio()
+            if ratio > 0.6:
+                combined_solution = wrapped_solution_ocr
+            else:
+                combined_solution = f"{wrapped_student}\n\n{wrapped_solution_ocr}"
         else:
             combined_solution = wrapped_solution_ocr
         yield {"event": "ocr_done", "source": "solution", "text": solution_ocr}
@@ -555,16 +580,18 @@ def review(
     review_prompt = build_review_prompt(
         combined_problem, standard_reference, formatted_steps, formatted_links,
         mcp_tool_descriptions=mcp_tool_desc,
+        num_steps=len(steps),
     )
     messages = [
         {"role": "system", "content": review_prompt},
         {"role": "user", "content": "请开始逐步批改"},
     ]
 
+    seen_steps = set()
     review_steps_raw = []
     for i in range(1, review_cfg["max_iter"] + 1):
         yield {"event": "grading_step", "step": i, "n": review_cfg["max_iter"]}
-        response = solver_chat(messages, temperature=0.2, max_tokens=4096)
+        response = solver_chat(messages, temperature=0.2, max_tokens=8192)
         messages.append({"role": "assistant", "content": response})
         code_blocks = extract_code_blocks(response)
         tool_calls = extract_tool_calls(response)
@@ -601,8 +628,24 @@ def review(
                 )
                 messages.append({"role": "user", "content": mcp_msg})
 
-        review_steps_raw.append(format_iteration(i, response, exec_result, mcp_results))
+        review_steps_raw.append(format_iteration(i, strip_code_blocks(response), exec_result, mcp_results))
         yield {"event": "step_done", "i": f"review_{i}", "content": review_steps_raw[-1]}
+
+        # 解析当前 iteration 的 step 置信度 + 正误，每个 step 单独 yield 一个事件
+        step_conf = parse_step_confidence(response)
+        step_correct = parse_step_correctness(response)
+        for step_num, conf in step_conf.items():
+            if step_num in seen_steps:
+                continue
+            seen_steps.add(step_num)
+            is_correct = step_correct.get(step_num, False)
+            yield {
+                "event": "step_graded",
+                "step": step_num,
+                "confidence": conf,
+                "is_correct": is_correct,
+                "iteration": i,
+            }
 
         if not code_blocks and not tool_calls:
             break
@@ -658,5 +701,41 @@ def review(
             "ocr_problem": image_description,
             "ocr_solution": solution_ocr,
             "difficulty": difficulty,
+        },
+    }
+
+
+def generate_similar_problems(problem: str, n: int = 3):
+    """举一反三：根据题目生成 n 道同类型练习题。Generator。
+
+    事件流:
+      - "knowledge_extracted" {text}: 知识点抽取完成
+      - "generating_similar"
+      - "similar_done" {text}: 相似题生成完成
+      - "final" {result: {knowledge_points, similar_problems}}
+    """
+    yield {"event": "knowledge_extracting"}
+    kp_response = solver_chat(
+        [{"role": "user", "content": KNOWLEDGE_POINT_PROMPT.format(problem=problem)}],
+        temperature=0.3,
+        max_tokens=512,
+    )
+    yield {"event": "knowledge_extracted", "text": kp_response}
+
+    yield {"event": "generating_similar"}
+    sim_response = solver_chat(
+        [{"role": "user", "content": SIMILAR_PROBLEM_PROMPT.format(
+            n=n, problem=problem, knowledge_points=kp_response,
+        )}],
+        temperature=0.7,
+        max_tokens=2048,
+    )
+    yield {"event": "similar_done", "text": sim_response}
+
+    yield {
+        "event": "final",
+        "result": {
+            "knowledge_points": kp_response,
+            "similar_problems": sim_response,
         },
     }

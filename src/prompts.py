@@ -65,6 +65,7 @@ $$
 - Always use ```python``` code blocks for computations. Do NOT compute purely in natural language.
 - Use print() to output key intermediate results AND the final answer.
 - Every mathematical expression MUST use LaTeX notation: $$...$$ for display, $...$ for inline.
+- **多行等式链 (例如 "a = b = c = d") 必须在 $$...$$ 块中独占多行, 不要塞进 $...$ 行内**, 否则渲染会失败。
 - Include verification code whenever possible:
   - For derivatives: verify by differentiating and checking.
   - For integrals: verify by differentiating the result to recover the original.
@@ -76,6 +77,15 @@ $$
 - Respond in the same language as the user's question (Chinese/English).
 - You may also use ```tool``` blocks to call MCP external tools for cross-verification or operations beyond local execution capability.
 - Plan your reasoning framework first (what steps, what computations needed), then fill in specifics via code/tool calls (Chain-of-Abstraction principle).
+
+## OUTPUT HYGIENE (避免 UI 渲染污染)
+你的输出会被直接显示给用户。**严禁**在输出中混入以下 agent 内部元叙述 (它们会泄露到 UI 让用户看不懂):
+- 不要写 "输出:" / "输出 (简化)" / "Output:" 这类重复说明词
+- 不要写 "实际上," / "我们还可以" / "我们应统一表示" / "现在用..." 等 agent 间对话
+- 不要写 "### Step 2 ###" / "### Step 3 ###" 等下一轮的元标题 (每轮只输出当前 step)
+- 不要写 "[步骤1]" / "[步骤2]" / "[Step 1]" 等前缀编号 (step 编号会由前端自动加)
+- 每个公式块用 $$...$$ 独占行, 不要在 $...$ 内联里包含 \\\\ 换行
+- 重点: 你是在"对用户说话", 不是在"和后续 agent 通信"
 
 Available Tool References:
 
@@ -584,6 +594,7 @@ CRITICAL RULES:
 - If a step contains both explanation text and a formula, include both.
 - If the writing is ambiguous, provide your best interpretation and mark it with [ambiguous: ...].
 - Do NOT solve the problem or judge correctness. Only transcribe.
+- **ANTI-HALLUCINATION**: Do NOT repeat or duplicate any step. Each Step N: must contain content NOT already covered by Step 1, Step 2, ..., Step N-1. If two regions of the image show the same content (e.g., the student re-traced a step, or the same step appears in a separate box), transcribe it ONCE under a single step number — do NOT assign two different step numbers to identical content.
 - Respond in the same language as the image content (Chinese/English).
 """
 
@@ -653,15 +664,27 @@ For each step, perform TWO independent checks:
 
 ## Output Format (STRICT)
 
+## ⛔ ANTI-DUPLICATION RULE (MANDATORY)
+- Each **Step N** MUST correspond to a DISTINCT, DIFFERENT part of the student solution.
+- If two student steps have IDENTICAL or near-identical content, you MUST merge them into ONE step. Write **Step N** once, then add a note: "(学生在此步重复了前文内容，已合并)".
+- NEVER output **Step N** whose content is a restatement of a previous step. This is the #1 most common mistake — DO NOT do it.
+- NEVER write **Step 2: 重复 Step 1** or **Step N: same as Step M**. If a step duplicates an earlier one, SKIP IT ENTIRELY. Do not assign it a step number at all.
+- Before outputting each **Step N**, ask yourself: "Did I already evaluate this exact content in an earlier step?" If YES → skip it.
+
 ### 📝 题目回顾
 (Brief restatement of the problem)
 
 ### 🔍 逐步批改
+There are exactly **{num_steps}** student steps. You MUST output judgments for **Step 1 through Step {num_steps} ONLY.
+Do NOT create additional steps. Do NOT split a step into sub-steps. Do NOT merge steps. Do NOT repeat any step.
+Output exactly {num_steps} step judgments — no more, no less.
+
 For each step:
 
-**Step N**: (restate the student step content)
+**Step N**: (DO NOT restate the step content — just evaluate it by its step number. The student steps have already been provided to you in the Input section above. Only output the judgment fields below.)
 - 判断: ✓ 或 ✗
 - 错误类别: [CALCULATION_ERROR / LOGIC_ERROR / CONCEPT_ERROR / NOTATION_ERROR / ACCUMULATION_ERROR / 无]
+- 置信度: 0 到 100 的整数,表示你对本步判断的把握程度
 - 说明: (If ✗: detailed explanation of what is wrong, why, and what the correct approach would be)
 - 前提步骤: [list premise step indices]
 - 前提状态: (whether premises are all ✓ or some are ✗)
@@ -669,16 +692,18 @@ For each step:
 ### ❌ 错误总结
 (List all error steps with category. For accumulation errors, trace back to the root native error.)
 
-### ✅ 正确解法参考
-(Provide the complete correct solution from the standard reference, with LaTeX formulas. If the student used a different valid approach, also show how their approach would look when done correctly.)
-
-### 📊 批改结论
-$$\\boxed{{\\text{{正确步骤: X/Y, 错误类型: ..., 首错步骤: Step N}}}}$$
+Do NOT output "正确解法参考" or "批改结论" sections — the system will append those automatically.
 
 ## Tool References (for code-based verification if needed)
 {calculus_ref}
 
 {probability_ref}
+
+## Confidence Score Guide (for per-step confidence output)
+- 90-100: 高度确信本步正确（无误）
+- 70-89: 基本正确但存在疑点（如计算过程不严谨、表述含糊）
+- 50-69: 存在错误可能,需要更仔细的判断
+- 0-49: 存在明显错误或难以判断,标注主要疑虑
 """
 
 
@@ -703,6 +728,7 @@ def build_review_prompt(
     student_steps: str,
     premise_links: str,
     mcp_tool_descriptions: str = "",
+    num_steps: int = 5,
 ) -> str:
     base = REVIEW_SYSTEM_PROMPT.format(
         problem=problem,
@@ -711,6 +737,7 @@ def build_review_prompt(
         premise_links=premise_links,
         calculus_ref=CALCULUS_REFERENCE,
         probability_ref=PROBABILITY_REFERENCE,
+        num_steps=num_steps,
     )
     if mcp_tool_descriptions:
         base += "\n\n" + mcp_tool_descriptions
@@ -755,3 +782,61 @@ def build_metacheck_prompt(problem: str, student_solution: str, grading_result: 
     )
     base += "\n\n" + UNTRUSTED_CONTENT_GUARD
     return base
+
+
+KNOWLEDGE_POINT_PROMPT = """\
+你是一个数学知识点分析专家。
+从以下数学问题中识别它考查的**核心知识点**（按重要性排序，3-5 个）。
+
+对每个知识点给出:
+- **名称**：用简短的术语命名（如"分部积分法"、"贝叶斯定理"、"定积分的几何应用"）
+- **简述**：1 句话说明该知识点在此题中的作用
+- **难度级别**：easy / medium / hard
+
+## Output Format
+```
+1. 名称: <name>
+   简述: <description>
+   难度: <level>
+
+2. 名称: <name>
+   ...
+```
+
+## 题目
+{problem}
+"""
+
+
+SIMILAR_PROBLEM_PROMPT = """\
+你是一个数学题目生成专家。
+基于以下数学问题及其考查的核心知识点，生成 **{n} 道**同类型但题目不同的练习题。
+
+## 要求
+1. 每道题涉及 1-2 个**相同**的核心知识点
+2. 难度**相近**（不出现 easy 题对应 hard 知识点，或反之）
+3. 题目表述各异，**不要照搬原题**的数字或场景
+4. 数学公式用 LaTeX 格式（`$...$` 或 `$$...$$`）
+5. 给出每题的**简略答案**（不写完整解法过程，只给最终结果）
+6. 输出的题目应涵盖**不同的角度**（如分布积分法可以考察不同的被积函数）
+
+## Output Format
+```
+### 题目 1
+(题目描述含 LaTeX 公式)
+
+**答案**: $...$
+
+### 题目 2
+(题目描述)
+
+**答案**: $...$
+...
+```
+
+## 原题
+{problem}
+
+## 知识点清单
+{knowledge_points}
+"""
