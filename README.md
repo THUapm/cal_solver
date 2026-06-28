@@ -104,22 +104,6 @@ All configuration is via environment variables in `.env`:
 
 ---
 
-## 🧪 Testing
-
-The project ships with 4 hand-rolled test suites:
-
-```bash
-python test_p0_fixes.py    # LLM client + code execution + parsing (32 tests)
-python test_skills.py      # Schema classification + USC + few-shot (14 tests)
-python test_examples.py    # Code executor + parsers + B1/B2 generator (11 tests)
-python test_mcp.py                  # Offline MCP tool parsers
-python test_mcp.py --with-mcp      # Live MCP server tests (requires API key)
-```
-
-All offline tests pass without an API key.
-
----
-
 ## 📂 Project Structure
 
 ```
@@ -131,12 +115,12 @@ cal_solver/
 ├── README.md
 ├── .env.example                  # Environment variable template
 ├── .gitignore
-├── .gitattributes                 # UTF-16 hint for validation set
+├── .gitattributes                # UTF-16 hint for validation set
 │
 ├── assets/                        # Frontend assets
 │   ├── theme.py                  # LinearLight / LinearDark themes
-│   ├── style.css                 # 400 lines of custom CSS
-│   └── head.html                 # Inter / JetBrains Mono + KaTeX + observer
+│   ├── style.css                 # Custom CSS
+│   └── head.html                 # Inter / JetBrains Mono fonts + observer
 │
 ├── src/                           # Backend modules
 │   ├── agent.py                  # Orchestrator (generator with USC)
@@ -151,13 +135,8 @@ cal_solver/
 │       ├── calculus.py           # SymPy reference
 │       └── probability.py        # scipy.stats reference
 │
-├── .claude/skills/                # Claude skill docs
-│   └── gradio-ui-design/          # Gradio design guideline
-│
-├── 验证集/                        # Validation set (10 calculus problems)
-│   └── 微积分.json               # UTF-16 encoded
-│
-└── test_*.py                      # 4 test suites
+└── 验证集/                        # Validation set (calculus problems)
+    └── 微积分.json               # UTF-16 encoded
 ```
 
 ---
