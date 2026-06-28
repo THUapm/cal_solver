@@ -49,3 +49,14 @@ test_math.png
 # Claude / agent 工具配置（与智能体运行无关）
 .claude/
 .agents/
+
+# 本地课程提交物与临时资源（不入 GitHub 源码仓库）
+*.pptx
+汇报PPT/
+课程项目.pdf
+report.zip
+test_min5.pdf
+eval/
+eval_data/
+pic/
+repo/
