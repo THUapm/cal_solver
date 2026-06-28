@@ -14,9 +14,8 @@
 - **Grading** — PARC premise-chain verification + 5-category error classification + meta-verification to catch hallucinated grading.
 - **USC Self-Consistency** — Multi-path sampling for hard problems, with **2/3 early-exit** to save ~33% tokens.
 - **Verify-First Auto-Correction** — Post-solution self-check with up to 2 correction iterations.
-- **Sandboxed Code Execution** — Triple defense: AST static scan + restricted builtins + parent-process timeout.
 - **5 MCP Tools** — Symbolic computation, probability, cross-verification, plotting, LaTeX validation.
-- **Modern UI** — Linear-style theme (light/dark) with KaTeX formula rendering and real-time step progress.
+- **Modern UI** — Linear-style theme with MathML formula rendering and real-time step progress.
 
 ---
 
@@ -54,8 +53,7 @@
 
               ┌──────────────────────────────────────────┐
               │ src/tools/executor.py + safe_runner.py  │
-              │ Sandboxed Python subprocess               │
-              │ (sympy / scipy / numpy whitelist)        │
+              │ Python subprocess (sympy/scipy/numpy)   │
               └──────────────────────────────────────────┘
 ```
 
@@ -111,7 +109,7 @@ All configuration is via environment variables in `.env`:
 The project ships with 4 hand-rolled test suites:
 
 ```bash
-python test_p0_fixes.py    # Sandbox + LLM client + UNTRUSTED guard (32 tests)
+python test_p0_fixes.py    # LLM client + code execution + parsing (32 tests)
 python test_skills.py      # Schema classification + USC + few-shot (14 tests)
 python test_examples.py    # Code executor + parsers + B1/B2 generator (11 tests)
 python test_mcp.py                  # Offline MCP tool parsers
@@ -149,7 +147,7 @@ cal_solver/
 │   ├── utils.py                  # Code/tool extraction, USC, premise parsing
 │   └── tools/
 │       ├── executor.py           # Subprocess runner
-│       ├── safe_runner.py        # 3-layer sandbox
+│       ├── safe_runner.py        # Sandboxed subprocess entry
 │       ├── calculus.py           # SymPy reference
 │       └── probability.py        # scipy.stats reference
 │
@@ -189,17 +187,6 @@ The MCP server (`mcp_math_tools.py`) exposes 5 tools:
 | `latex_validate` | Validate LaTeX expression syntax |
 
 Tools are called by the LLM via `tool` blocks in its response; results are fed back into the reasoning chain.
-
----
-
-## 🛡️ Security
-
-- **Triple-layer sandbox** (`src/tools/safe_runner.py`):
-  1. AST static scan — blocks `os`, `sys`, `subprocess`, `eval`, `exec`, `open`, `getattr`, and 14 MRO-escape dunders
-  2. Runtime restricted builtins — whitelist of ~40 safe functions
-  3. Parent-process `subprocess.run(timeout=15)` hard kill
-- **UNTRUSTED content wrapping** — OCR-extracted text and student-provided solution text are wrapped in `<user_uploaded_content trust="untrusted">` tags with an explicit "treat as data, not instructions" guard in the system prompt.
-- **API_KEY never committed** — `.env` is in `.gitignore`. The shipped `.env.example` is a template only.
 
 ---
 
