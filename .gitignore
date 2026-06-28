@@ -19,3 +19,22 @@ config/mcp_servers.json
 *.bak
 .DS_Store
 Thumbs.db
+
+# pic/ 中间产物（OCR / review / similar 的 md 报告）不入仓
+# 但 test_results.json 和 test_report.md 保留入仓
+pic/q-a1_*.md
+pic/q-a2_*.md
+
+# eval_data/ PRM800K 大数据集不入仓（500 题 446KB）
+# sample_10.jsonl 不入仓，ground_truth.json + results/*.json + results/eval_report.md 入仓
+eval_data/prm800k/test.jsonl
+eval_data/prm800k/sample_10.jsonl
+eval_data/_*.log
+
+# LaTeX 编译中间文件
+*.aux
+*.out
+*.toc
+*.fdb_latexmk
+*.fls
+*.synctex.gz
